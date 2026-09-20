@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>平面约束草图</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #15181d; color: #d8dee9;
+    user-select: none; -webkit-user-select: none;
+  }
+  #wrap { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  canvas.panning { cursor: grabbing; }
+  #bar {
+    position: fixed; top: 10px; left: 10px; right: 10px;
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    background: rgba(28,32,40,.92); border: 1px solid #333a46;
+    border-radius: 10px; padding: 8px 10px; z-index: 5;
+  }
+  button {
+    background: #2a313d; color: #d8dee9; border: 1px solid #3d4655;
+    border-radius: 7px; padding: 5px 10px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #353e4c; }
+  button.active { background: #3b6ea5; border-color: #5590c4; color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  .sep { width: 1px; height: 22px; background: #3d4655; margin: 0 2px; }
+  #hint {
+    position: fixed; bottom: 10px; left: 10px; max-width: 60vw;
+    background: rgba(28,32,40,.92); border: 1px solid #333a46;
+    border-radius: 10px; padding: 8px 12px; font-size: 12px; line-height: 1.7; z-index: 5;
+  }
+  #status {
+    position: fixed; bottom: 10px; right: 10px;
+    background: rgba(28,32,40,.92); border: 1px solid #333a46;
+    border-radius: 10px; padding: 8px 12px; font-size: 12px; z-index: 5;
+    font-variant-numeric: tabular-nums;
+  }
+  #status .ok { color: #7ee787; }
+  #status .bad { color: #ff7b72; font-weight: 600; }
+  kbd { background:#111; border:1px solid #444; border-bottom-width:2px;
+    border-radius:4px; padding:0 5px; font-size:11px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+
+<div id="bar">
+  <button data-tool="select" class="active">选择/拖动</button>
+  <button data-tool="point">点</button>
+  <button data-tool="line">线段</button>
+  <button data-tool="circle">圆</button>
+  <span class="sep"></span>
+  <button id="btnCoincide">重合</button>
+  <button id="btnDist">固定距离</button>
+  <button id="btnHoriz">水平</button>
+  <button id="btnVert">竖直</button>
+  <button id="btnTangent">点圆相切</button>
+  <button id="btnFix">固定点</button>
+  <button id="btnDelete">删除</button>
+  <span class="sep"></span>
+  <button id="btnUndo">撤销</button>
+  <button id="btnRedo">重做</button>
+  <span class="sep"></span>
+  <button id="btnDemoPlay">示例：四连杆（可拖）</button>
+  <button id="btnDemoConflict">示例：冲突</button>
+  <button id="btnClear">清空</button>
+</div>
+
+<div id="hint"></div>
+<div id="status"></div>
+
+<script>
+"use strict";
+
+/* ================= 数据模型 =================
+ * points:    {id, x, y, fixed}
+ * segments:  {id, p1, p2}
+ * circles:   {id, c(点id), r}
+ * constraints:
+ *   coincide(a,b)            两点重合
+ *   distance(a,b,d)          两点固定距离
+ *   horizontal(a,b)/vertical 两点连线水平/竖直
+ *   tangent(p, circle)       点在圆上（点与圆相切）
+ * fixed 点不进求解变量。坐标一律世界坐标，渲染才换算屏幕坐标。
+ */
+let model = blankModel();
+let selection = [];
+let pendingLineP1 = null;
+let tool = 'select';
+let history = [], histIdx = -1;
+
+const view = { scale: 60, ox: 0, oy: 0 };
+let canvas = document.getElementById('cv');
+let ctx = canvas.getContext('2d');
+let dpr = 1;
+let lastSolveInfo = null;
+
+function blankModel() {
+  return { points: [], segments: [], circles: [], constraints: [], seq: 1 };
+}
+function newId(prefix) { return prefix + (model.seq++); }
+function P(id) { return model.points.find(p => p.id === id); }
+function SEG(id) { return model.segments.find(s => s.id === id); }
+function CIR(id) { return model.circles.find(c => c.id === id); }
+
+/* ================= 坐标变换：世界 <-> 屏幕 ================= */
+function worldToScreen(wx, wy) { return [wx * view.scale + view.ox, -wy * view.scale + view.oy]; }
+function screenToWorld(sx, sy) { return [(sx - view.ox) / view.scale, (view.oy - sy) / view.scale]; }
+
+/* ================= LM 求解器（解析雅可比，有限步，绝不卡死） ================= */
+const SOLVE = { maxIter: 80, maxMs: 24 };
+const VIOLATION_TOL = 0.05;   // 世界单位：单约束残差超过即判定未满足并标红
+
+// anchors: 拖动锚点 [{id,x,y,w}]
+function residualRows(anchors) {
+  const rows = [];
+  for (const c of model.constraints) {
+    if (c.kind === 'coincide') {
+      const a = P(c.a), b = P(c.b);
+      rows.push({ cid: c.id, w: 1, vals: [a.x - b.x, a.y - b.y],
+        kind: 'coincide', refs: [c.a, c.b] });
+    } else if (c.kind === 'distance') {
+      const a = P(c.a), b = P(c.b);
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1e-9;
+      rows.push({ cid: c.id, w: 1, vals: [d - c.d],
+        grad: { [c.a]: [-dx / d, -dy / d], [c.b]: [dx / d, dy / d] } });
+    } else if (c.kind === 'horizontal') {
+      const a = P(c.a), b = P(c.b);
+      rows.push({ cid: c.id, w: 1, vals: [b.y - a.y],
+        grad: { [c.a]: [0, -1], [c.b]: [0, 1] } });
+    } else if (c.kind === 'vertical') {
+      const a = P(c.a), b = P(c.b);
+      rows.push({ cid: c.id, w: 1, vals: [b.x - a.x],
+        grad: { [c.a]: [-1, 0], [c.b]: [1, 0] } });
+    } else if (c.kind === 'tangent') {
+      const p = P(c.p), cir = CIR(c.circle), ce = P(cir.c);
+      const dx = p.x - ce.x, dy = p.y - ce.y, d = Math.hypot(dx, dy) || 1e-9;
+      rows.push({ cid: c.id, w: 1, vals: [d - cir.r],
+        grad: { [c.p]: [dx / d, dy / d], [cir.c]: [-dx / d, -dy / d] } });
+    }
+  }
+  return rows;
+}
+function flatR(rows) {
+  const r = [];
+  for (const row of rows) for (const v of row.vals) r.push(v * row.w);
+  return r;
+}
+
+let solveT0 = 0;
+function solve(opts) {
+  opts = opts || {};
+  solveT0 = performance.now();
+  // 拖动：把被拖点钉到光标（临时固定，不进变量），只解其余点
+  let dragPinned = null, dragSaved = null;
+  if (opts.drag) {
+    dragPinned = P(opts.drag.id);
+    if (dragPinned) {
+      dragSaved = [dragPinned.x, dragPinned.y, dragPinned.fixed];
+      dragPinned.x = opts.drag.x; dragPinned.y = opts.drag.y; dragPinned.fixed = true;
+    }
+  }
+  try { return solveInner(); }
+  finally { if (dragPinned) dragPinned.fixed = dragSaved[2]; }
+}
+
+function solveInner() {
+  const t0 = solveT0;
+  const free = model.points.filter(p => !p.fixed);
+  const idx = new Map();
+  free.forEach((p, i) => idx.set(p.id, 2 * i));
+  const n = free.length * 2;
+
+  let rows = residualRows();
+  let r = flatR(rows);
+  const m = r.length;
+  const info = { badCids: new Set(), maxErr: 0, iters: 0, ms: 0, stalled: false };
+  if (m === 0 || n === 0) return finish(info, residualRows(), t0);
+
+  function buildJ(curRows) {
+    const J = [];
+    for (const row of curRows) {
+      if (row.kind === 'coincide') {
+        for (let k = 0; k < 2; k++) {
+          const e = [];
+          for (let j = 0; j < row.refs.length; j++) {
+            const col = idx.get(row.refs[j]);
+            if (col !== undefined) e.push([col + k, j === 0 ? 1 : -1]);
+          }
+          J.push(e);
+        }
+      } else {
+        const e = [];
+        for (const pid in row.grad) {
+          const col = idx.get(pid);
+          if (col !== undefined) {
+            const g = row.grad[pid];
+            e.push([col, g[0]], [col + 1, g[1]]);
+          }
+        }
+        J.push(e);
+      }
+    }
+    return J;
+  }
+  const energy = rv => { let s = 0; for (const v of rv) s += v * v; return s; };
+
+  let curE = energy(r), lambda = 1e-3;
+  let iters = 0;
+  for (; iters < SOLVE.maxIter; iters++) {
+    if (performance.now() - t0 > SOLVE.maxMs) { info.stalled = true; break; }
+    const J = buildJ(rows);
+    const H = Array.from({ length: n }, () => new Float64Array(n));
+    const g = new Float64Array(n);
+    for (let i = 0; i < m; i++)
+      for (const [ci, jv] of J[i]) {
+        g[ci] += jv * r[i];
+        for (const [cj, kv] of J[i]) H[ci][cj] += jv * kv;
+      }
+    let gradNorm = 0;
+    for (let i = 0; i < n; i++) gradNorm = Math.max(gradNorm, Math.abs(g[i]));
+    if (gradNorm < 1e-11) break;
+
+    let accepted = false;
+    for (let trial = 0; trial < 12; trial++) {
+      const A = H.map(row => Float64Array.from(row));
+      for (let i = 0; i < n; i++) A[i][i] += lambda * (H[i][i] || 1);
+      const b = Float64Array.from(g, v => -v);
+      if (!gaussSolve(A, b)) { lambda *= 4; continue; }
+      const saved = free.map(p => [p.x, p.y]);
+      // 信任域：每点单步位移封顶，避免大残差下步长冲断约束
+      const MAXSTEP = 0.35;
+      let maxLen = 0;
+      for (let i = 0; i < free.length; i++)
+        maxLen = Math.max(maxLen, Math.hypot(b[2 * i], b[2 * i + 1]));
+      const shrink = maxLen > MAXSTEP ? MAXSTEP / maxLen : 1;
+      for (let i = 0; i < free.length; i++) {
+        free[i].x += b[2 * i] * shrink;
+        free[i].y += b[2 * i + 1] * shrink;
+      }
+      const nr = flatR(residualRows());
+      const ne = energy(nr);
+      if (ne < curE) {
+        curE = ne; lambda = Math.max(lambda * 0.4, 1e-10); accepted = true;
+        rows = residualRows(); r = flatR(rows); break;
+      }
+      free.forEach((p, i) => { p.x = saved[i][0]; p.y = saved[i][1]; });
+      lambda *= 4;
+    }
+    if (!accepted) { info.stalled = true; break; }
+    if (curE < 1e-12) { iters++; break; }
+  }
+  info.iters = iters;
+  return finish(info, residualRows(), t0);
+}
+
+function gaussSolve(A, b) {
+  const n = b.length;
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let i = col + 1; i < n; i++)
+      if (Math.abs(A[i][col]) > Math.abs(A[piv][col])) piv = i;
+    if (Math.abs(A[piv][col]) < 1e-14) return false;
+    if (piv !== col) {
+      const tr = A[piv]; A[piv] = A[col]; A[col] = tr;
+      const tb = b[piv]; b[piv] = b[col]; b[col] = tb;
+    }
+    for (let i = col + 1; i < n; i++) {
+      const f = A[i][col] / A[col][col];
+      if (f === 0) continue;
+      for (let j = col; j < n; j++) A[i][j] -= f * A[col][j];
+      b[i] -= f * b[col];
+    }
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    let s = b[i];
+    for (let j = i + 1; j < n; j++) s -= A[i][j] * b[j];
+    b[i] = s / A[i][i];
+  }
+  return true;
+}
+
+function finish(info, rows, t0) {
+  for (const row of rows) {
+    if (row.cid == null) continue;
+    for (const v of row.vals) {
+      const err = Math.abs(v * row.w);
+      info.maxErr = Math.max(info.maxErr, err);
+      if (err > VIOLATION_TOL) info.badCids.add(row.cid);
+    }
+  }
+  info.ms = (performance.now() - t0).toFixed(2);
+  lastSolveInfo = info;
+  return info;
+}
+
+/* ================= 历史（操作级快照，非画面刷新） ================= */
+function snapshot() { return JSON.stringify({ model, view, sel: selection, pen: pendingLineP1 }); }
+function restore(snap) {
+  const s = JSON.parse(snap);
+  model = s.model; selection = s.sel || []; pendingLineP1 = s.pen || null;
+  if (s.view) Object.assign(view, s.view);
+}
+// history[histIdx] 永远等于当前状态。
+// 调用方在“修改并求解/渲染之后”调用 commit()，把新状态压栈；
+// 载入全新模型（示例/清空）调用 resetHistory()。
+function resetHistory() {
+  history = [snapshot()]; histIdx = 0;
+}
+function commit() {
+  history = history.slice(0, histIdx + 1);
+  history.push(snapshot());
+  if (history.length > 200) history.shift();
+  histIdx = history.length - 1;
+}
+function undo() { if (histIdx > 0) { histIdx--; restore(history[histIdx]); render(); updateUI(); } }
+function redo() { if (histIdx < history.length - 1) { histIdx++; restore(history[histIdx]); render(); updateUI(); } }
+
+/* ================= 图元操作 ================= */
+function addPoint(wx, wy, fixed) {
+  const p = { id: newId('p'), x: wx, y: wy, fixed: !!fixed };
+  model.points.push(p); return p;
+}
+function addSegment(p1, p2) {
+  const s = { id: newId('l'), p1, p2 };
+  model.segments.push(s); return s;
+}
+function addCircle(c, r) {
+  const cir = { id: newId('c'), c, r };
+  model.circles.push(cir); return cir;
+}
+function addConstraint(kind, data) {
+  const con = Object.assign({ id: newId('k'), kind }, data);
+  model.constraints.push(con); return con;
+}
+function deleteSelected() {
+  const sels = new Set(selection);
+  const pts = new Set();
+  model.segments = model.segments.filter(s => {
+    if (sels.has(s.id)) { pts.add(s.p1); pts.add(s.p2); return false; }
+    return true;
+  });
+  model.circles = model.circles.filter(c => !sels.has(c.id));
+  const deadPts = new Set(model.points.filter(p => sels.has(p.id)).map(p => p.id));
+  // 仅当点被显式删除时删点；删线段不自动删端点
+  model.constraints = model.constraints.filter(k => {
+    const refs = constraintPointRefs(k);
+    return !refs.some(id => deadPts.has(id));
+  });
+  // 圆被删 → 关联约束删；删圆心点同理
+  const liveCircles = new Set(model.circles.map(c => c.id));
+  model.constraints = model.constraints.filter(k => {
+    if (k.kind === 'tangent' && !liveCircles.has(k.circle)) return false;
+    return true;
+  });
+  model.points = model.points.filter(p => !deadPts.has(p.id));
+  selection = [];
+  pendingLineP1 = null;
+}
+function constraintPointRefs(k) {
+  if (k.kind === 'tangent') return [k.p, CIR(k.circle) ? CIR(k.circle).c : null];
+  return [k.a, k.b];
+}
+
+/* ================= 命中检测（屏幕像素距离） ================= */
+function hitTest(sx, sy) {
+  const tolPx = 8;
+  // 点优先
+  for (let i = model.points.length - 1; i >= 0; i--) {
+    const p = model.points[i];
+    const [px, py] = worldToScreen(p.x, p.y);
+    if (Math.hypot(px - sx, py - sy) <= tolPx) return { type: 'point', id: p.id };
+  }
+  // 圆：到圆周的距离
+  for (let i = model.circles.length - 1; i >= 0; i--) {
+    const cir = model.circles[i], ce = P(cir.c);
+    const [cx, cy] = worldToScreen(ce.x, ce.y);
+    if (Math.abs(Math.hypot(cx - sx, cy - sy) - cir.r * view.scale) <= tolPx)
+      return { type: 'circle', id: cir.id };
+  }
+  // 线段
+  for (let i = model.segments.length - 1; i >= 0; i--) {
+    const s = model.segments[i];
+    const a = P(s.p1), b = P(s.p2);
+    const [ax, ay] = worldToScreen(a.x, a.y);
+    const [bx, by] = worldToScreen(b.x, b.y);
+    if (distToSeg(sx, sy, ax, ay, bx, by) <= tolPx)
+      return { type: 'segment', id: s.id };
+  }
+  return null;
+}
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy || 1e-9;
+  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+/* ================= 鼠标交互 ================= */
+let drag = null;          // {kind:'point'|'pan', ...}
+let spaceDown = false;
+
+canvas.addEventListener('mousedown', e => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  const [wx, wy] = screenToWorld(sx, sy);
+
+  if (e.button === 1 || spaceDown) {
+    drag = { kind: 'pan', sx, sy, ox: view.ox, oy: view.oy };
+    canvas.classList.add('panning');
+    e.preventDefault();
+    return;
+  }
+  if (e.button !== 0) return;
+
+  if (tool === 'point') {
+    addPoint(wx, wy);
+    solve(); render(); commit(); updateUI();
+    return;
+  }
+  if (tool === 'circle') {
+    const center = addPoint(wx, wy);
+    const edge = addPoint(wx + 1, wy);
+    const cir = addCircle(center.id, 1);
+    // edge 点在圆上的相切约束：拖 edge 点即改半径
+    addConstraint('tangent', { p: edge.id, circle: cir.id });
+    solve(); render(); commit(); updateUI();
+    return;
+  }
+  if (tool === 'line') {
+    const hit = hitTest(sx, sy);
+    if (hit && hit.type === 'point') {
+      if (!pendingLineP1) { pendingLineP1 = hit.id; }
+      else if (pendingLineP1 !== hit.id) {
+        addSegment(pendingLineP1, hit.id);
+        pendingLineP1 = null;
+        solve(); render(); commit(); updateUI();
+      }
+    } else {
+      const np = addPoint(wx, wy);
+      let created = false;
+      if (!pendingLineP1) { pendingLineP1 = np.id; }
+      else { addSegment(pendingLineP1, np.id); pendingLineP1 = null; created = true; }
+      solve(); render(); if (created) commit(); updateUI();
+    }
+    return;
+  }
+
+  // select 工具
+  const hit = hitTest(sx, sy);
+  if (hit && hit.type === 'point') {
+    if (!selection.includes(hit.id)) {
+      if (!e.shiftKey) selection = [];
+      selection.push(hit.id);
+    }
+    const p = P(hit.id);
+    drag = { kind: 'point', id: hit.id, moved: false };
+    render(); updateUI();
+  } else if (hit) {
+    if (!selection.includes(hit.id)) {
+      if (!e.shiftKey) selection = [];
+      selection.push(hit.id);
+    }
+    render(); updateUI();
+  } else {
+    selection = [];
+    pendingLineP1 = null;
+    render(); updateUI();
+  }
+});
+
+window.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  if (!drag) return;
+  if (drag.kind === 'pan') {
+    view.ox = drag.ox + (sx - drag.sx);
+    view.oy = drag.oy + (sy - drag.sy);
+    render();
+    return;
+  }
+  if (drag.kind === 'point') {
+    const [wx, wy] = screenToWorld(sx, sy);
+    drag.moved = true;
+    // 拖动：把被拖点作为高权重锚点，其余点由约束联动求解
+    solve({ drag: { id: drag.id, x: wx, y: wy } });
+    render(); updateStatusOnly();
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  if (drag && drag.kind === 'point' && drag.moved) {
+    // 一次拖动 = 一个操作：把拖动后的当前状态压栈
+    solve();            // 松手后去掉锚点，按纯约束再解一次
+    render(); commit(); updateUI();
+  }
+  drag = null;
+  canvas.classList.remove('panning');
+});
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  const [wxBefore, wyBefore] = screenToWorld(sx, sy);
+  const factor = Math.exp(-e.deltaY * 0.0012);
+  view.scale = Math.min(2000, Math.max(8, view.scale * factor));
+  // 以光标下的世界点为不动锚：缩放后该点仍在光标下
+  view.ox = sx - wxBefore * view.scale;
+  view.oy = sy + wyBefore * view.scale;
+  render();
+}, { passive: false });
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { spaceDown = true; canvas.style.cursor = 'grab'; e.preventDefault(); }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+    e.preventDefault(); e.shiftKey ? redo() : undo();
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (selection.length) { deleteSelected(); solve(); render(); commit(); updateUI(); }
+  }
+  if (e.key === 'Escape') { selection = []; pendingLineP1 = null; render(); updateUI(); }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') { spaceDown = false; canvas.style.cursor = ''; }
+});
+
+/* ================= 约束命令 ================= */
+function selectedPoints() {
+  return selection.filter(id => id.startsWith('p') && P(id));
+}
+function selectedCircles() {
+  return selection.filter(id => id.startsWith('c') && CIR(id));
+}
+function circleViaSelected(id) {
+  if (id.startsWith('c') && CIR(id)) return CIR(id);
+  // 选中圆心点也算选中其圆（取以该点为心的第一个圆）
+  return model.circles.find(c => c.c === id);
+}
+
+function cmdConstraint(kind) {
+  const pts = selectedPoints();
+  const cids = selectedCircles();
+
+  if (kind === 'coincide') {
+    if (pts.length !== 2) return warn('重合：请选中两个点');
+    if (pts[0] === pts[1]) return;
+    pushC(addConstraint('coincide', { a: pts[0], b: pts[1] }));
+  } else if (kind === 'distance') {
+    if (pts.length !== 2) return warn('固定距离：请选中两个点');
+    const cur = Math.hypot(P(pts[0]).x - P(pts[1]).x, P(pts[0]).y - P(pts[1]).y);
+    const v = prompt('固定距离（当前 = ' + cur.toFixed(2) + '）：', cur.toFixed(3));
+    if (v == null) return;
+    const d = parseFloat(v);
+    if (!(d > 0)) return warn('距离必须为正数');
+    pushC(addConstraint('distance', { a: pts[0], b: pts[1], d }));
+  } else if (kind === 'horizontal') {
+    if (pts.length !== 2) return warn('水平：请选中两个点');
+    pushC(addConstraint('horizontal', { a: pts[0], b: pts[1] }));
+  } else if (kind === 'vertical') {
+    if (pts.length !== 2) return warn('竖直：请选中两个点');
+    pushC(addConstraint('vertical', { a: pts[0], b: pts[1] }));
+  } else if (kind === 'tangent') {
+    // 需要一个点 + 一个圆（或圆心点）
+    const cirSel = selection.map(circleViaSelected).filter(Boolean)[0];
+    if (!cirSel) return warn('点圆相切：请选中一个点和一个圆（或圆心）');
+    const p = pts.find(id => id !== cirSel.c);
+    if (!p) return warn('点圆相切：除圆心外还需选中圆上的那个点');
+    pushC(addConstraint('tangent', { p, circle: cirSel.id }));
+  } else if (kind === 'fix') {
+    if (pts.length !== 1) return warn('固定点：请选中一个点');
+    const p = P(pts[0]);
+    p.fixed = !p.fixed;
+    solve(); render(); commit(); updateUI();
+  }
+}
+function pushC() {
+  solve();
+  if (selection.length) selection = [];
+  render(); commit(); updateUI();
+}
+let warnTimer = null;
+function warn(msg) {
+  const el = document.getElementById('hint');
+  el.innerHTML = '<span style="color:#ff7b72">⚠ ' + msg + '</span>';
+  clearTimeout(warnTimer);
+  warnTimer = setTimeout(updateHint, 2200);
+}
+
+/* ================= 渲染 ================= */
+function render() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  drawGrid(w, h);
+
+  const bad = lastSolveInfo ? lastSolveInfo.badCids : new Set();
+  const isBad = id => bad.has(id);
+
+  // 圆
+  for (const cir of model.circles) {
+    const ce = P(cir.c);
+    const [cx, cy] = worldToScreen(ce.x, ce.y);
+    let badCircle = false;
+    // 与该圆相关的相切约束若违反，圆标红
+    for (const k of model.constraints)
+      if (k.kind === 'tangent' && k.circle === cir.id && isBad(k.id)) badCircle = true;
+    ctx.beginPath();
+    ctx.arc(cx, cy, cir.r * view.scale, 0, Math.PI * 2);
+    ctx.lineWidth = selection.includes(cir.id) ? 3 : 1.8;
+    ctx.strokeStyle = badCircle ? '#ff5252' : (selection.includes(cir.id) ? '#66b3ff' : '#9fb2c8');
+    ctx.stroke();
+    // 半径标注
+    const ang = Math.PI / 4;
+    const [ex, ey] = worldToScreen(ce.x + cir.r * Math.cos(ang), ce.y + cir.r * Math.sin(ang));
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey);
+    ctx.strokeStyle = badCircle ? 'rgba(255,82,82,.6)' : 'rgba(159,178,200,.5)';
+    ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // 线段
+  for (const s of model.segments) {
+    const a = P(s.p1), b = P(s.p2);
+    const [ax, ay] = worldToScreen(a.x, a.y);
+    const [bx, by] = worldToScreen(b.x, b.y);
+    // 线段本身不直接挂约束；若其端点参与的距离约束违反，整条线段标红
+    let segBad = false;
+    for (const k of model.constraints) {
+      if (!isBad(k.id)) continue;
+      const refs = constraintPointRefs(k);
+      if (refs.includes(s.p1) && refs.includes(s.p2)) segBad = true;
+    }
+    const sel = selection.includes(s.id);
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+    ctx.lineWidth = sel ? 3.5 : 2.5;
+    ctx.strokeStyle = segBad ? '#ff5252' : (sel ? '#66b3ff' : '#c7d3e3');
+    ctx.stroke();
+  }
+
+  // 约束小记号（在相关图元中点）
+  drawConstraintGlyphs(bad);
+
+  // 点
+  for (const p of model.points) {
+    const [px, py] = worldToScreen(p.x, p.y);
+    let pBad = false;
+    for (const k of model.constraints)
+      if (isBad(k.id) && constraintPointRefs(k).includes(p.id)) pBad = true;
+    const sel = selection.includes(p.id);
+    ctx.beginPath();
+    ctx.arc(px, py, sel ? 6.5 : 5, 0, Math.PI * 2);
+    ctx.fillStyle = p.fixed ? '#ffd166' : (pBad ? '#ff5252' : (sel ? '#66b3ff' : '#e8eef7'));
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = pBad ? '#ff5252' : '#222';
+    ctx.stroke();
+    if (p.fixed) {
+      ctx.beginPath(); ctx.moveTo(px - 4, py + 7); ctx.lineTo(px + 4, py + 7);
+      ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2; ctx.stroke();
+    }
+  }
+
+  updateStatusOnly();
+}
+
+function drawGrid(w, h) {
+  const step = view.scale;            // 1 世界单位
+  const [wx0] = screenToWorld(0, 0);
+  const [wx1] = screenToWorld(w, h);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(255,255,255,.05)';
+  const startX = Math.floor(wx0);
+  for (let gx = startX; gx <= Math.ceil(wx1); gx++) {
+    const [sx] = worldToScreen(gx, 0);
+    ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, h); ctx.stroke();
+  }
+  const [, wy0] = screenToWorld(0, h);
+  const [, wy1] = screenToWorld(0, 0);
+  const startY = Math.floor(wy0);
+  for (let gy = startY; gy <= Math.ceil(wy1); gy++) {
+    const [, sy] = worldToScreen(0, gy);
+    ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(w, sy); ctx.stroke();
+  }
+  // 坐标轴
+  const [zxx, zxy] = worldToScreen(0, 0);
+  ctx.strokeStyle = 'rgba(255,255,255,.18)';
+  ctx.beginPath(); ctx.moveTo(0, zxy); ctx.lineTo(w, zxy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(zxx, 0); ctx.lineTo(zxx, h); ctx.stroke();
+}
+
+function drawConstraintGlyphs(bad) {
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  for (const k of model.constraints) {
+    const violated = bad.has(k.id);
+    const color = violated ? '#ff5252' : 'rgba(126,231,135,.9)';
+    let mx, my, label = '';
+    if (k.kind === 'tangent') {
+      const p = P(k.p), ce = P(CIR(k.circle).c);
+      [mx, my] = worldToScreen((p.x + ce.x) / 2, (p.y + ce.y) / 2);
+      label = 'T';
+    } else {
+      const a = P(k.a), b = P(k.b);
+      if (!a || !b) continue;
+      [mx, my] = worldToScreen((a.x + b.x) / 2, (a.y + b.y) / 2);
+      label = k.kind === 'coincide' ? '≡'
+        : k.kind === 'distance' ? 'd=' + k.d.toFixed(1)
+        : k.kind === 'horizontal' ? 'H'
+        : k.kind === 'vertical' ? 'V' : '';
+    }
+    if (label === '≡') {
+      // 重合不画文字，画两个小同心圈
+      ctx.beginPath(); ctx.arc(mx, my, 9, 0, Math.PI * 2);
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+      continue;
+    }
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = 'rgba(20,24,30,.8)';
+    ctx.fillRect(mx - tw / 2 - 3, my - 16, tw + 6, 13);
+    ctx.fillStyle = color;
+    ctx.fillText(label, mx, my - 6);
+  }
+}
+
+/* ================= 状态栏 / 工具栏 UI ================= */
+function updateStatusOnly() {
+  const el = document.getElementById('status');
+  const info = lastSolveInfo;
+  if (!info) { el.innerHTML = ''; return; }
+  const badN = info.badCids.size;
+  if (badN > 0) {
+    el.innerHTML = '<span class="bad">✗ ' + badN + ' 条约束无法满足（已标红）</span>' +
+      ' · 最大残差 ' + info.maxErr.toFixed(3) +
+      ' · 迭代 ' + info.iters + ' · ' + info.ms + 'ms';
+  } else {
+    el.innerHTML = '<span class="ok">✓ 约束满足</span>' +
+      ' · 最大残差 ' + info.maxErr.toFixed(4) +
+      ' · 迭代 ' + info.iters + ' · ' + info.ms + 'ms';
+  }
+}
+function updateUI() {
+  document.querySelectorAll('button[data-tool]').forEach(b =>
+    b.classList.toggle('active', b.dataset.tool === tool));
+  document.getElementById('btnUndo').disabled = histIdx <= 0;
+  document.getElementById('btnRedo').disabled = histIdx >= history.length - 1;
+  updateStatusOnly();
+  updateHint();
+}
+function updateHint() {
+  const tips = {
+    select: '<b>选择/拖动</b>：拖动任意点，其余点按约束联动；点空白取消选择，Shift 多选。',
+    point: '<b>点工具</b>：在画布单击放一个点。',
+    line: '<b>线段工具</b>：依次点两个点（可复用已有点）连成线段。',
+    circle: '<b>圆工具</b>：单击放圆心，并生成一个圆和圆上的“半径点”，拖它可改半径。'
+  };
+  const extra = '<br>加约束：先选图元再点上方约束按钮。' +
+    ' 滚轮缩放（以光标为锚）、按住 <kbd>空格</kbd> 或中键拖动平移、' +
+    '<kbd>Delete</kbd> 删除、<kbd>⌘Z</kbd>/<kbd>⌘⇧Z</kbd> 撤销重做、<kbd>Esc</kbd> 取消选择。' +
+    ' 黄色=固定点，红色=冲突约束。';
+  document.getElementById('hint').innerHTML = (tips[tool] || '') + extra;
+}
+
+document.querySelectorAll('button[data-tool]').forEach(b => {
+  b.addEventListener('click', () => {
+    tool = b.dataset.tool;
+    pendingLineP1 = null;
+    updateUI();
+  });
+});
+document.getElementById('btnCoincide').onclick = () => cmdConstraint('coincide');
+document.getElementById('btnDist').onclick = () => cmdConstraint('distance');
+document.getElementById('btnHoriz').onclick = () => cmdConstraint('horizontal');
+document.getElementById('btnVert').onclick = () => cmdConstraint('vertical');
+document.getElementById('btnTangent').onclick = () => cmdConstraint('tangent');
+document.getElementById('btnFix').onclick = () => cmdConstraint('fix');
+document.getElementById('btnDelete').onclick = () => {
+  if (selection.length) { deleteSelected(); solve(); render(); commit(); updateUI(); }
+};
+document.getElementById('btnUndo').onclick = undo;
+document.getElementById('btnRedo').onclick = redo;
+document.getElementById('btnClear').onclick = () => {
+  model = blankModel(); selection = []; pendingLineP1 = null;
+  centerView(0, 0, 60); solve(); render(); resetHistory(); updateUI();
+};
+document.getElementById('btnDemoPlay').onclick = loadDemoPlay;
+document.getElementById('btnDemoConflict').onclick = loadDemoConflict;
+
+function centerView(cx, cy, scale) {
+  view.scale = scale;
+  view.ox = canvas.clientWidth / 2 - cx * scale;
+  view.oy = canvas.clientHeight / 2 + cy * scale;
+}
+
+/* ================= 示例 ================= */
+// 示例一：四连杆 + 圆相切。固定两个机架铰点，三根定长杆连成闭环，
+// 另有一个固定圆，连杆延长点被“点圆相切”钉在圆周上。
+// 系统仍保留 1 个装配自由度——拖任意活动点，整个连杆会被拽着转，一眼看出解算在动。
+function loadDemoPlay() {
+  model = blankModel(); selection = []; pendingLineP1 = null;
+  const A = addPoint(-3, 0, true);    // 机架左铰（固定）
+  const B = addPoint(3, 0, true);     // 机架右铰（固定）
+  const C = addPoint(-1.6, 2.2);
+  const D = addPoint(1.8, 2.0);
+
+  addSegment(A.id, C.id);
+  addSegment(C.id, D.id);
+  addSegment(D.id, B.id);
+
+  const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+  addConstraint('distance', { a: A.id, b: C.id, d: +dist(A, C).toFixed(3) });
+  addConstraint('distance', { a: C.id, b: D.id, d: +dist(C, D).toFixed(3) });
+
+  // 固定圆与右铰同心，半径=初始 BD；相切约束直接充当 BD 杆长，
+  // 拖 C/D 时连杆沿圆周转动，点圆相切参与联动。
+  const cir = addCircle(B.id, +dist(D, B).toFixed(3));
+  addConstraint('tangent', { p: D.id, circle: cir.id });
+
+  centerView(0, 1, 60);
+  solve(); render(); resetHistory(); updateUI();
+}
+
+// 示例二：明显冲突。三个点两两定长，边长 3/3/8，违反三角不等式，无解。
+// LM 会停在最小二乘折中，三条距离约束残差都很大 → 三条边与约束标红。
+function loadDemoConflict() {
+  model = blankModel(); selection = []; pendingLineP1 = null;
+  const A = addPoint(-1.5, 0, true);   // 三个顶点全部固定：先摆成等边三角形
+  const B = addPoint(1.5, 0, true);
+  const C = addPoint(0, 2.598, true);
+  addSegment(A.id, B.id);
+  addSegment(B.id, C.id);
+  addSegment(C.id, A.id);
+  addConstraint('distance', { a: A.id, b: B.id, d: 3 });  // 三条边本应都是 3
+  addConstraint('distance', { a: B.id, b: C.id, d: 3 });
+  addConstraint('distance', { a: C.id, b: A.id, d: 3 });
+  // 再要求同一对点距离为 8：与上面的 3 直接冲突，无法移动（点全固定），该边标红
+  addConstraint('distance', { a: C.id, b: A.id, d: 8 });
+  centerView(0, 1, 60);
+  solve(); render(); resetHistory(); updateUI();
+}
+
+/* ================= 初始化 ================= */
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(canvas.clientWidth * dpr);
+  canvas.height = Math.round(canvas.clientHeight * dpr);
+  render();
+}
+window.addEventListener('resize', resize);
+
+// 脚本位于 body 末尾，#cv 已存在
+resize();
+loadDemoPlay();   // 默认就是可拖着玩的例子
+
+</script>
+</body>
+</html>
