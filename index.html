@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>平面约束草图</title>
+  <style>
+    html, body { margin: 0; height: 100%; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    body { display: flex; flex-direction: column; background: #1e1f24; color: #ddd; overflow: hidden; }
+    #bar {
+      display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      padding: 8px 10px; background: #2a2c33; border-bottom: 1px solid #3a3d46;
+    }
+    #bar .group { display: flex; gap: 4px; align-items: center; padding-right: 8px; border-right: 1px solid #3a3d46; }
+    #bar .group:last-child { border-right: none; }
+    button {
+      background: #3a3d46; color: #ddd; border: 1px solid #4a4d56; border-radius: 5px;
+      padding: 5px 10px; font-size: 13px; cursor: pointer;
+    }
+    button:hover { background: #474b56; }
+    button.active { background: #2d6cdf; border-color: #4a86f0; color: #fff; }
+    button:disabled { opacity: .35; cursor: default; }
+    label.title { font-size: 12px; color: #9aa0ad; }
+    #main { flex: 1; display: flex; min-height: 0; }
+    #side {
+      width: 210px; background: #26282f; border-right: 1px solid #3a3d46;
+      overflow-y: auto; padding: 8px; font-size: 12px; box-sizing: border-box;
+    }
+    #side h3 { margin: 10px 0 4px; font-size: 12px; color: #9aa0ad; font-weight: 600; }
+    .crow { display: flex; justify-content: space-between; align-items: center; gap: 4px; padding: 3px 4px; border-radius: 4px; }
+    .crow:hover { background: #32343c; }
+    .crow.conflict { background: #5a2222; }
+    .crow button { padding: 1px 6px; font-size: 11px; }
+    #wrap { flex: 1; position: relative; }
+    canvas { display: block; width: 100%; height: 100%; cursor: default; background: #1e1f24; }
+    #status {
+      position: absolute; left: 10px; bottom: 10px; display: flex; gap: 14px;
+      background: rgba(20,22,28,.82); border: 1px solid #3a3d46; border-radius: 6px;
+      padding: 6px 12px; font-size: 12px; pointer-events: none;
+    }
+    #status .ok { color: #6ad36a; }
+    #status .bad { color: #ff6b6b; font-weight: 700; }
+    #hint {
+      position: absolute; left: 10px; top: 10px; max-width: 460px;
+      background: rgba(20,22,28,.82); border: 1px solid #3a3d46; border-radius: 6px;
+      padding: 6px 12px; font-size: 12px; color: #c8cdd8; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <div class="group">
+      <label class="title">绘制</label>
+      <button data-tool="select" class="active">选择/拖动</button>
+      <button data-tool="point">点</button>
+      <button data-tool="segment">线段</button>
+      <button data-tool="circle">圆</button>
+      <button data-tool="pan">平移</button>
+    </div>
+    <div class="group">
+      <label class="title">约束（先在列表/图上选好对象）</label>
+      <button id="btn-coincident">重合</button>
+      <button id="btn-distance">固定距离</button>
+      <button id="btn-horizontal">水平</button>
+      <button id="btn-vertical">竖直</button>
+      <button id="btn-tangent">点圆相切</button>
+      <button id="btn-fix">锚定点</button>
+    </div>
+    <div class="group">
+      <button id="btn-undo">撤销</button>
+      <button id="btn-redo">重做</button>
+      <button id="btn-delete">删除</button>
+    </div>
+    <div class="group">
+      <button id="btn-demo-play">示例：四连杆</button>
+      <button id="btn-demo-conflict">示例：冲突</button>
+    </div>
+  </div>
+  <div id="main">
+    <div id="side">
+      <h3>对象</h3>
+      <div id="entityList"></div>
+      <h3>约束</h3>
+      <div id="constraintList"></div>
+      <h3>帮助</h3>
+      <div style="color:#8b919e;line-height:1.7">
+        滚轮缩放（朝光标），空格或中键拖拽平移。<br>
+        画线/圆时点空白处会自动建点。<br>
+        约束按钮按提示依次点对象；Esc 取消。<br>
+        Delete 删除选中对象及其相关约束。<br>
+        冲突约束在图上标红。
+      </div>
+    </div>
+    <div id="wrap">
+      <canvas id="cv"></canvas>
+      <div id="hint">拖动任意点，观察约束联动。红色约束表示当前无法同时满足。</div>
+      <div id="status"></div>
+    </div>
+  </div>
+  <script src="solver.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
